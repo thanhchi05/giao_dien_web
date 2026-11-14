@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Giám sát té ngã</title>
+<style>
+:root { font-family: system-ui, sans-serif; color:#14213a; background:#eef3fa; }
+* { box-sizing:border-box }
+body { max-width:960px; padding:24px; margin:auto }
+header, .card { padding:20px; border:1px solid #d8e1ee; border-radius:16px; background:#fff }
+header { background:#132343; color:#fff; margin-bottom:16px }
+h1,h2,p { margin:0 0 12px }
+h2 { font-size:1rem }
+.grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-bottom:16px }
+.value { font-size:2rem; font-weight:700; font-variant-numeric:tabular-nums }
+small { color:#435473 }
+button,select { font:inherit; border:1px solid #b4c3d8; border-radius:8px; padding:8px 12px }
+button { background:#1757a9; color:#fff; cursor:pointer }
+button:disabled { background:#e5ebf4; color:#4b5870; cursor:default }
+.controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center }
+canvas { display:block; width:100%; height:145px; margin-top:10px }
+#alarm { color:#a61a21; font-weight:700 }
+#connection, #feedback { min-height:1.4em }
+@media(max-width:580px) { .grid { grid-template-columns:1fr } body { padding:12px } }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Giám sát té ngã</h1>
+  <p id="connection" role="status">Đang kết nối MQTT…</p>
+</header>
+<main>
+  <div class="grid">
+    <section class="card">
+      <h2>Độ lớn gia tốc</h2>
+      <div class="value"><span id="magnitude">—</span> g</div>
+      <small id="axes">X — · Y — · Z —</small>
+      <canvas id="acceleration" aria-label="Biểu đồ gia tốc từ 0 đến 16 g" role="img"></canvas>
+    </section>
+    <section class="card">
+      <h2>Góc nghiêng so với trục +Z</h2>
+      <div class="value"><span id="tilt">—</span>°</div>
+      <small>0° đến 180°</small>
+      <canvas id="inclination" aria-label="Biểu đồ góc nghiêng từ 0 đến 180 độ" role="img"></canvas>
+    </section>
+  </div>
+  <section class="card">
+    <h2>Điều khiển cảnh báo</h2>
+    <p id="alarm" role="status">Đang chờ dữ liệu ESP32</p>
+    <div class="controls">
+      <label for="mode">Chế độ</label>
+      <select id="mode" disabled><option value="auto">Tự động</option><option value="manual">Thủ công</option></select>
+      <button id="led" disabled>Đèn LED</button>
+      <button id="buzzer" disabled>Còi</button>
+    </div>
+    <small id="feedback" role="status"></small>
+  </section>
+</main>
+<script>
+const topic = 'utc/fall/8c317a82dd624959';
+const byId = id => document.getElementById(id);
+const mode = byId('mode');
+const led = byId('led');
+const buzzer = byId('buzzer');
+const feedback = byId('feedback');
+const history = [];
+let sample = null;
+let receivedAt = 0;
+let pending = null;
+let client;
+
+function draw(id, key, limit, color) {
+  const canvas = byId(id);
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const left = 28, bottom = h - 12, top = 9;
+  ctx.font = '11px system-ui';
+  for (let i = 0; i <= 4; i++) {
+    const y = bottom - i * (bottom - top) / 4;
+    ctx.strokeStyle = '#dbe4ef';
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.fillStyle = '#435473'; ctx.fillText(String(i * limit / 4), 0, y + 4);
+  }
+  if (history.length === 0) return;
+  const latest = history.at(-1).at;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  history.forEach(({at, data}, i) => {
+    const x = w - (latest - at) / 15000 * (w - left);
+    const y = bottom - Math.max(0, Math.min(data[key] / limit, 1)) * (bottom - top);
+    if (i) ctx.lineTo(x, y);
+    else ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function drawCharts() {
+  draw('acceleration', 'g', 16, '#1757a9');
+  draw('inclination', 'tilt', 180, '#007b70');
+}
+
+function refresh() {
+  const live = Boolean(client?.connected && sample && Date.now() - receivedAt < 2500);
+  const alarm = byId('alarm');
+  alarm.textContent = live ? (sample.fall ? 'Phát hiện té ngã' : 'Bình thường') : 'Đang chờ dữ liệu ESP32';
+  byId('magnitude').textContent = live ? sample.g.toFixed(2) : '—';
+  byId('tilt').textContent = live ? sample.tilt.toFixed(1) : '—';
+  byId('axes').textContent = live
+    ? ['ax','ay','az'].map(key => key[1].toUpperCase() + ' ' + sample[key].toFixed(2)).join(' · ') + ' g'
+    : 'X — · Y — · Z —';
+  if (pending && live && sample[pending.key] === pending.value) {
+    pending = null;
+    feedback.textContent = 'ESP32 đã xác nhận trạng thái.';
+  } else if (pending && Date.now() > pending.deadline) {
+    pending = null;
+    feedback.textContent = 'Chưa nhận được xác nhận từ ESP32.';
+  }
+  mode.disabled = !live || Boolean(pending);
+  led.disabled = buzzer.disabled = !live || !sample.manual || Boolean(pending);
+  if (live && !pending) mode.value = sample.manual ? 'manual' : 'auto';
+  led.textContent = live ? 'Đèn LED · ' + (sample.led ? 'Bật' : 'Tắt') : 'Đèn LED';
+  buzzer.textContent = live ? 'Còi · ' + (sample.buzzer ? 'Bật' : 'Tắt') : 'Còi';
+}
+
+function send(command, key, value) {
+  if (!client?.connected || pending) return;
+  pending = {key, value, deadline:Date.now() + 3000};
+  feedback.textContent = 'Đang chờ ESP32 xác nhận…';
+  client.publish(topic + '/cmd', command, {qos:0, retain:false});
+  refresh();
+}
+
+mode.onchange = () => send(mode.value, 'manual', mode.value === 'manual');
+led.onclick = () => send(sample.led ? 'led:off' : 'led:on', 'led', !sample.led);
+buzzer.onclick = () => send(sample.buzzer ? 'buzzer:off' : 'buzzer:on', 'buzzer', !sample.buzzer);
+
+if (!window.mqtt) {
+  byId('connection').textContent = 'Không tải được MQTT.js. Kiểm tra kết nối Internet.';
+} else {
+  client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {reconnectPeriod:2000, queueQoSZero:false});
+  client.on('connect', () => {
+    client.subscribe(topic + '/telemetry', (error, granted) => {
+      byId('connection').textContent = error || granted?.[0]?.qos !== 0
+        ? 'Không đăng ký được chủ đề MQTT' : 'Đã kết nối MQTT';
+    });
+  });
+  client.on('close', () => {
+    byId('connection').textContent = 'Mất kết nối MQTT · đang thử lại…';
+    sample = null;
+    refresh();
+  });
+  client.on('error', () => { byId('connection').textContent = 'Lỗi kết nối MQTT'; });
+  client.on('message', (name, message) => {
+    if (name !== topic + '/telemetry') return;
+    let data;
+    try { data = JSON.parse(message.toString()); } catch { return; }
+    if (!data || !['ax','ay','az','g','tilt'].every(key => Number.isFinite(data[key])) ||
+        !['manual','fall','led','buzzer'].every(key => typeof data[key] === 'boolean')) return;
+    sample = data;
+    receivedAt = Date.now();
+    history.push({at:receivedAt, data});
+    while (history[0].at < receivedAt - 15000) history.shift();
+    refresh();
+    drawCharts();
+  });
+}
+window.addEventListener('resize', drawCharts);
+setInterval(refresh, 250);
+drawCharts();
+</script>
+</body>
+</html>
